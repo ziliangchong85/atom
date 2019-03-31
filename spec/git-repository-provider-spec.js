@@ -1,16 +1,19 @@
 const path = require('path')
 const fs = require('fs-plus')
 const temp = require('temp').track()
-const {Directory} = require('pathwatcher')
+const { Directory } = require('pathwatcher')
 const GitRepository = require('../src/git-repository')
 const GitRepositoryProvider = require('../src/git-repository-provider')
-const {it, fit, ffit, fffit, beforeEach} = require('./async-spec-helpers')
 
 describe('GitRepositoryProvider', () => {
   let provider
 
   beforeEach(() => {
-    provider = new GitRepositoryProvider(atom.project, atom.config, atom.confirm)
+    provider = new GitRepositoryProvider(
+      atom.project,
+      atom.config,
+      atom.confirm
+    )
   })
 
   afterEach(() => {
@@ -24,7 +27,9 @@ describe('GitRepositoryProvider', () => {
   describe('.repositoryForDirectory(directory)', () => {
     describe('when specified a Directory with a Git repository', () => {
       it('resolves with a GitRepository', async () => {
-        const directory = new Directory(path.join(__dirname, 'fixtures', 'git', 'master.git'))
+        const directory = new Directory(
+          path.join(__dirname, 'fixtures', 'git', 'master.git')
+        )
         const result = await provider.repositoryForDirectory(directory)
         expect(result).toBeInstanceOf(GitRepository)
         expect(provider.pathToRepository[result.getPath()]).toBeTruthy()
@@ -39,7 +44,9 @@ describe('GitRepositoryProvider', () => {
           new Directory(path.join(__dirname, 'fixtures', 'git', 'master.git'))
         )
         const secondRepo = await provider.repositoryForDirectory(
-          new Directory(path.join(__dirname, 'fixtures', 'git', 'master.git', 'objects'))
+          new Directory(
+            path.join(__dirname, 'fixtures', 'git', 'master.git', 'objects')
+          )
         )
 
         expect(firstRepo).toBeInstanceOf(GitRepository)
@@ -72,7 +79,10 @@ describe('GitRepositoryProvider', () => {
       it('returns a Promise that resolves to a GitRepository', async () => {
         const gitDirPath = path.join(__dirname, 'fixtures', 'git', 'master.git')
         const workDirPath = temp.mkdirSync('git-workdir')
-        fs.writeFileSync(path.join(workDirPath, '.git'), `gitdir: ${gitDirPath}\n`)
+        fs.writeFileSync(
+          path.join(workDirPath, '.git'),
+          `gitdir: ${gitDirPath}\n`
+        )
 
         const directory = new Directory(workDirPath)
         const result = await provider.repositoryForDirectory(directory)
@@ -90,7 +100,9 @@ describe('GitRepositoryProvider', () => {
         const subdirectory = {}
         directory = {
           getSubdirectory () {},
-          isRoot () { return true }
+          isRoot () {
+            return true
+          }
         }
         spyOn(directory, 'getSubdirectory').andReturn(subdirectory)
       })
@@ -145,7 +157,7 @@ describe('GitRepositoryProvider', () => {
         fs.writeFileSync(path.join(dirPath, '.git', 'refs'), '')
 
         const directory = new Directory(dirPath)
-        const repo =  provider.repositoryForDirectorySync(directory)
+        const repo = provider.repositoryForDirectorySync(directory)
         expect(repo).toBe(null)
       })
     })
