@@ -23,6 +23,11 @@ const ConfigSchema = require('../config-schema')
 
 const LocationSuffixRegExp = /(:\d+)(:\d+)?$/
 
+// Increment this when changing the serialization format of `${ATOM_HOME}/storage/application.json` used by
+// AtomApplication::saveCurrentWindowOptions() and AtomApplication::loadPreviousWindowOptions() in a backward-
+// incompatible way.
+const APPLICATION_STATE_VERSION = '1'
+
 const getDefaultPath = () => {
   const editor = atom.workspace.getActiveTextEditor()
   if (!editor || !editor.getPath()) {
@@ -247,8 +252,7 @@ class AtomApplication extends EventEmitter {
       this.config.onDidChange('core.colorProfile', () => this.promptForRestart())
     }
 
-    const optionsForWindowsToOpen = []
-
+    let optionsForWindowsToOpen = []
     let shouldReopenPreviousWindows = false
 
     if (options.test || options.benchmark || options.benchmarkTest) {
@@ -264,9 +268,7 @@ class AtomApplication extends EventEmitter {
     }
 
     if (shouldReopenPreviousWindows) {
-      for (const previousOptions of await this.loadPreviousWindowOptions()) {
-        optionsForWindowsToOpen.push(previousOptions)
-      }
+      optionsForWindowsToOpen = [...await this.loadPreviousWindowOptions(), ...optionsForWindowsToOpen]
     }
 
     if (optionsForWindowsToOpen.length === 0) {
@@ -478,17 +480,17 @@ class AtomApplication extends EventEmitter {
 
   // Registers basic application commands, non-idempotent.
   handleEvents () {
-    const getLoadSettings = includeWindow => {
-      const window = this.focusedWindow()
+    const createOpenSettings = ({event, sameWindow}) => {
+      const targetWindow = event ? this.atomWindowForEvent(event) : this.focusedWindow()
       return {
-        devMode: window ? window.devMode : false,
-        safeMode: window ? window.safeMode : false,
-        window: includeWindow && window ? window : null
+        devMode: targetWindow ? targetWindow.devMode : false,
+        safeMode: targetWindow ? targetWindow.safeMode : false,
+        window: sameWindow && targetWindow ? targetWindow : null
       }
     }
 
     this.on('application:quit', () => app.quit())
-    this.on('application:new-window', () => this.openPath(getLoadSettings(false)))
+    this.on('application:new-window', () => this.openPath(createOpenSettings({})))
     this.on('application:new-file', () => (this.focusedWindow() || this).openPath())
     this.on('application:open-dev', () => this.promptForPathToOpen('all', {devMode: true}))
     this.on('application:open-safe', () => this.promptForPathToOpen('all', {safeMode: true}))
@@ -517,9 +519,16 @@ class AtomApplication extends EventEmitter {
         this.openPaths({ pathsToOpen: paths })
       })
 
-      this.on('application:open', () => this.promptForPathToOpen('all', getLoadSettings(true), getDefaultPath()))
-      this.on('application:open-file', () => this.promptForPathToOpen('file', getLoadSettings(true), getDefaultPath()))
-      this.on('application:open-folder', () => this.promptForPathToOpen('folder', getLoadSettings(true), getDefaultPath()))
+      this.on('application:open', () => {
+        this.promptForPathToOpen('all', createOpenSettings({sameWindow: true}), getDefaultPath())
+      })
+      this.on('application:open-file', () => {
+        this.promptForPathToOpen('file', createOpenSettings({sameWindow: true}), getDefaultPath())
+      })
+      this.on('application:open-folder', () => {
+        this.promptForPathToOpen('folder', createOpenSettings({sameWindow: true}), getDefaultPath())
+      })
+
       this.on('application:bring-all-windows-to-front', () => Menu.sendActionToFirstResponder('arrangeInFront:'))
       this.on('application:hide', () => Menu.sendActionToFirstResponder('hide:'))
       this.on('application:hide-other-applications', () => Menu.sendActionToFirstResponder('hideOtherApplications:'))
@@ -590,6 +599,9 @@ class AtomApplication extends EventEmitter {
       this.deleteSocketSecretFile()
     }))
 
+    // Triggered by the 'open-file' event from Electron:
+    // https://electronjs.org/docs/api/app#event-open-file-macos
+    // For example, this is fired when a file is dragged and dropped onto the Atom application icon in the dock.
     this.disposable.add(ipcHelpers.on(app, 'open-file', (event, pathToOpen) => {
       event.preventDefault()
       this.openPath({pathToOpen})
@@ -623,16 +635,15 @@ class AtomApplication extends EventEmitter {
       }
     }))
 
-    // A request from the associated render process to open a new render process.
-    this.disposable.add(ipcHelpers.on(ipcMain, 'open', (event, options) => {
-      const window = this.atomWindowForEvent(event)
+    // A request from the associated render process to open a set of paths using the standard window location logic.
+    // Used for application:reopen-project.
+    this.disposable.add(ipcHelpers.on(ipcMain, 'open', (_event, options) => {
       if (options) {
         if (typeof options.pathsToOpen === 'string') {
           options.pathsToOpen = [options.pathsToOpen]
         }
 
         if (options.pathsToOpen && options.pathsToOpen.length > 0) {
-          options.window = window
           this.openPaths(options)
         } else {
           this.addWindow(this.createWindow(options))
@@ -640,6 +651,18 @@ class AtomApplication extends EventEmitter {
       } else {
         this.promptForPathToOpen('all', {window})
       }
+    }))
+
+    // Prompt for a file, folder, or either, then open the chosen paths. Files will be opened in the originating
+    // window; folders will be opened in a new window unless an existing window exactly contains all of them.
+    this.disposable.add(ipcHelpers.on(ipcMain, 'open-chosen-any', (event, defaultPath) => {
+      this.promptForPathToOpen('all', createOpenSettings({event, sameWindow: true}), defaultPath)
+    }))
+    this.disposable.add(ipcHelpers.on(ipcMain, 'open-chosen-file', (event, defaultPath) => {
+      this.promptForPathToOpen('file', createOpenSettings({event, sameWindow: true}), defaultPath)
+    }))
+    this.disposable.add(ipcHelpers.on(ipcMain, 'open-chosen-folder', (event, defaultPath) => {
+      this.promptForPathToOpen('folder', createOpenSettings({event}), defaultPath)
     }))
 
     this.disposable.add(ipcHelpers.on(ipcMain, 'update-application-menu', (event, template, menu) => {
@@ -666,19 +689,6 @@ class AtomApplication extends EventEmitter {
 
     this.disposable.add(ipcHelpers.on(ipcMain, 'command', (event, command) => {
       this.emit(command)
-    }))
-
-    this.disposable.add(ipcHelpers.on(ipcMain, 'open-command', (event, command, defaultPath) => {
-      switch (command) {
-        case 'application:open':
-          return this.promptForPathToOpen('all', getLoadSettings(true), defaultPath)
-        case 'application:open-file':
-          return this.promptForPathToOpen('file', getLoadSettings(true), defaultPath)
-        case 'application:open-folder':
-          return this.promptForPathToOpen('folder', getLoadSettings(true), defaultPath)
-        default:
-          return console.log(`Invalid open-command received: ${command}`)
-      }
     }))
 
     this.disposable.add(ipcHelpers.on(ipcMain, 'window-command', (event, command, ...args) => {
@@ -856,6 +866,7 @@ class AtomApplication extends EventEmitter {
   // Returns the {AtomWindow} for the given locations.
   windowForLocations (locationsToOpen, devMode, safeMode) {
     return this.getLastFocusedWindow(window =>
+      !window.isSpec &&
       window.devMode === devMode &&
       window.safeMode === safeMode &&
       window.containsLocations(locationsToOpen)
@@ -1011,13 +1022,13 @@ class AtomApplication extends EventEmitter {
       // focused window that matches the requested dev and safe modes.
       if (!existingWindow && addToLastWindow) {
         existingWindow = this.getLastFocusedWindow(win => {
-          return win.devMode === devMode && win.safeMode === safeMode
+          return !win.isSpec && win.devMode === devMode && win.safeMode === safeMode
         })
       }
 
       // Fall back to the last focused window that has no project roots.
       if (!existingWindow) {
-        existingWindow = this.getLastFocusedWindow(win => !win.hasProjectPaths())
+        existingWindow = this.getLastFocusedWindow(win => !win.isSpec && !win.hasProjectPaths())
       }
 
       // One last case: if *no* paths are directories, add to the last focused window.
@@ -1025,7 +1036,7 @@ class AtomApplication extends EventEmitter {
         const noDirectories = locationsToOpen.every(location => !location.isDirectory)
         if (noDirectories) {
           existingWindow = this.getLastFocusedWindow(win => {
-            return win.devMode === devMode && win.safeMode === safeMode
+            return !win.isSpec && win.devMode === devMode && win.safeMode === safeMode
           })
         }
       }
@@ -1131,27 +1142,58 @@ class AtomApplication extends EventEmitter {
   async saveCurrentWindowOptions (allowEmpty = false) {
     if (this.quitting) return
 
-    const states = []
-    for (let window of this.getAllWindows()) {
-      if (!window.isSpec) states.push({initialPaths: window.projectRoots})
+    const state = {
+      version: APPLICATION_STATE_VERSION,
+      windows: this.getAllWindows()
+        .filter(window => !window.isSpec)
+        .map(window => ({projectRoots: window.projectRoots}))
     }
-    states.reverse()
+    state.windows.reverse()
 
-    if (states.length > 0 || allowEmpty) {
-      await this.storageFolder.store('application.json', states)
+    if (state.windows.length > 0 || allowEmpty) {
+      await this.storageFolder.store('application.json', state)
       this.emit('application:did-save-state')
     }
   }
 
   async loadPreviousWindowOptions () {
-    const states = await this.storageFolder.load('application.json')
-    if (states) {
-      return states.map(state => ({
-        foldersToOpen: state.initialPaths,
+    const state = await this.storageFolder.load('application.json')
+    if (!state) {
+      return []
+    }
+
+    if (state.version === APPLICATION_STATE_VERSION) {
+      // Atom >=1.36.1
+      // Schema: {version: '1', windows: [{projectRoots: ['<root-dir>', ...]}, ...]}
+      return state.windows.map(each => ({
+        foldersToOpen: each.projectRoots,
         devMode: this.devMode,
-        safeMode: this.safeMode
+        safeMode: this.safeMode,
+        newWindow: true
       }))
+    } else if (state.version === undefined) {
+      // Atom <= 1.36.0
+      // Schema: [{initialPaths: ['<root-dir>', ...]}, ...]
+      return await Promise.all(
+        state.map(async windowState => {
+          // Classify each window's initialPaths as directories or non-directories
+          const classifiedPaths = await Promise.all(
+            windowState.initialPaths.map(initialPath => new Promise(resolve => {
+              fs.isDirectory(initialPath, isDir => resolve({initialPath, isDir}))
+            }))
+          )
+
+          // Only accept initialPaths that are existing directories
+          return {
+            foldersToOpen: classifiedPaths.filter(({isDir}) => isDir).map(({initialPath}) => initialPath),
+            devMode: this.devMode,
+            safeMode: this.safeMode,
+            newWindow: true
+          }
+        })
+      )
     } else {
+      // Unrecognized version (from a newer Atom?)
       return []
     }
   }

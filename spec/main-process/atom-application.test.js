@@ -100,10 +100,13 @@ describe('AtomApplication', function () {
 
         beforeEach(function () {
           app = scenario.addApplication({
-            applicationJson: [
-              { initialPaths: ['b'] },
-              { initialPaths: ['c'] }
-            ]
+            applicationJson: {
+              version: '1',
+              windows: [
+                { projectRoots: [scenario.convertRootPath('b')] },
+                { projectRoots: [scenario.convertRootPath('c')] }
+              ]
+            }
           })
         })
 
@@ -161,12 +164,12 @@ describe('AtomApplication', function () {
 
           it('restores windows when launched with a project path to open', async function () {
             await scenario.launch({app, pathsToOpen: ['a']})
-            await scenario.assert('[a _] [b _] [c _]')
+            await scenario.assert('[b _] [c _] [a _]')
           })
 
           it('restores windows when launched with a file path to open', async function () {
             await scenario.launch({app, pathsToOpen: ['a/1.md']})
-            await scenario.assert('[b 1.md] [c _]')
+            await scenario.assert('[b _] [c 1.md]')
           })
 
           it('collapses new paths into restored windows when appropriate', async function () {
@@ -184,6 +187,33 @@ describe('AtomApplication', function () {
             await scenario.open(parseCommandLine(['b']))
             await scenario.assert('[a _] [b _]')
           })
+        })
+      })
+
+      describe('with unversioned application state', function () {
+        it('reads "initialPaths" as project roots', async function () {
+          const app = scenario.addApplication({
+            applicationJson: [
+              {initialPaths: [scenario.convertRootPath('a')]},
+              {initialPaths: [scenario.convertRootPath('b'), scenario.convertRootPath('c')]}
+            ]
+          })
+          app.config.set('core.restorePreviousWindowsOnStart', 'always')
+
+          await scenario.launch({app})
+          await scenario.assert('[a _] [b,c _]')
+        })
+
+        it('filters file paths from project root lists', async function () {
+          const app = scenario.addApplication({
+            applicationJson: [
+              {initialPaths: [scenario.convertRootPath('b'), scenario.convertEditorPath('a/1.md')]}
+            ]
+          })
+          app.config.set('core.restorePreviousWindowsOnStart', 'always')
+
+          await scenario.launch({app})
+          await scenario.assert('[b _]')
         })
       })
     })
@@ -645,6 +675,18 @@ describe('AtomApplication', function () {
       assert.isNull(w._locations[0].initialLine)
       assert.isNull(w._locations[0].initialColumn)
     })
+
+    it('disregards test and benchmark windows', async function () {
+      await scenario.launch(parseCommandLine(['--test', 'b']))
+      await scenario.open(parseCommandLine(['--new-window']))
+      await scenario.open(parseCommandLine(['--test', 'c']))
+      await scenario.open(parseCommandLine(['--benchmark', 'b']))
+
+      await scenario.open(parseCommandLine(['a/1.md']))
+
+      // Test and benchmark StubWindows are visible as empty editor windows here
+      await scenario.assert('[_ _] [_ 1.md] [_ _] [_ _]')
+    })
   })
 
   if (process.platform === 'darwin' || process.platform === 'win32') {
@@ -745,6 +787,106 @@ describe('AtomApplication', function () {
     })
   })
 
+  describe('IPC handling', function () {
+    let w0, w1, w2, app
+
+    beforeEach(async function () {
+      w0 = (await scenario.launch(parseCommandLine(['a'])))[0]
+      w1 = await scenario.open(parseCommandLine(['--new-window']))
+      w2 = await scenario.open(parseCommandLine(['--new-window', 'b']))
+
+      app = scenario.getApplication(0)
+      sinon.spy(app, 'openPaths')
+      sinon.stub(app, 'promptForPath', (_type, callback, defaultPath) => callback([defaultPath]))
+    })
+
+    // This is the IPC message used to handle:
+    // * application:reopen-project
+    // * choosing "open in new window" when adding a folder that has previously saved state
+    // * deprecated call links in deprecation-cop
+    // * other direct callers of `atom.open()`
+    it('"open" opens a fixed path by the standard opening rules', async function () {
+      sinon.stub(app, 'atomWindowForEvent', () => w1)
+
+      electron.ipcMain.emit('open', {}, {pathsToOpen: scenario.convertEditorPath('a/1.md')})
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a 1.md] [_ _] [b _]')
+
+      electron.ipcMain.emit('open', {}, {pathsToOpen: scenario.convertRootPath('c')})
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a 1.md] [c _] [b _]')
+
+      electron.ipcMain.emit('open', {}, {pathsToOpen: scenario.convertRootPath('d')})
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a 1.md] [c _] [b _] [d _]')
+    })
+
+    it('"open-chosen-any" opens a file in the sending window', async function () {
+      sinon.stub(app, 'atomWindowForEvent', () => w2)
+
+      electron.ipcMain.emit('open-chosen-any', {}, scenario.convertEditorPath('a/1.md'))
+      await conditionPromise(() => app.openPaths.called)
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a _] [_ _] [b 1.md]')
+
+      assert.isTrue(app.promptForPath.called)
+      assert.strictEqual(app.promptForPath.lastCall.args[0], 'all')
+    })
+
+    it('"open-chosen-any" opens a directory by the standard opening rules', async function () {
+      sinon.stub(app, 'atomWindowForEvent', () => w1)
+
+      // Open unrecognized directory in empty window
+      electron.ipcMain.emit('open-chosen-any', {}, scenario.convertRootPath('c'))
+      await conditionPromise(() => app.openPaths.callCount > 0)
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a _] [c _] [b _]')
+
+      assert.strictEqual(app.promptForPath.callCount, 1)
+      assert.strictEqual(app.promptForPath.lastCall.args[0], 'all')
+
+      // Open unrecognized directory in new window
+      electron.ipcMain.emit('open-chosen-any', {}, scenario.convertRootPath('d'))
+      await conditionPromise(() => app.openPaths.callCount > 1)
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a _] [c _] [b _] [d _]')
+
+      assert.strictEqual(app.promptForPath.callCount, 2)
+      assert.strictEqual(app.promptForPath.lastCall.args[0], 'all')
+
+      // Open recognized directory in existing window
+      electron.ipcMain.emit('open-chosen-any', {}, scenario.convertRootPath('a'))
+      await conditionPromise(() => app.openPaths.callCount > 2)
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a _] [c _] [b _] [d _]')
+
+      assert.strictEqual(app.promptForPath.callCount, 3)
+      assert.strictEqual(app.promptForPath.lastCall.args[0], 'all')
+    })
+
+    it('"open-chosen-file" opens a file chooser and opens the chosen file in the sending window', async function () {
+      sinon.stub(app, 'atomWindowForEvent', () => w0)
+
+      electron.ipcMain.emit('open-chosen-file', {}, scenario.convertEditorPath('b/2.md'))
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a 2.md] [_ _] [b _]')
+
+      assert.isTrue(app.promptForPath.called)
+      assert.strictEqual(app.promptForPath.lastCall.args[0], 'file')
+    })
+
+    it('"open-chosen-folder" opens a directory chooser and opens the chosen directory', async function () {
+      sinon.stub(app, 'atomWindowForEvent', () => w0)
+
+      electron.ipcMain.emit('open-chosen-folder', {}, scenario.convertRootPath('c'))
+      await app.openPaths.lastCall.returnValue
+      await scenario.assert('[a _] [c _] [b _]')
+
+      assert.isTrue(app.promptForPath.called)
+      assert.strictEqual(app.promptForPath.lastCall.args[0], 'folder')
+    })
+  })
+
   describe('window state serialization', function () {
     it('occurs immediately when adding a window', async function () {
       await scenario.launch(parseCommandLine(['a']))
@@ -755,10 +897,13 @@ describe('AtomApplication', function () {
 
       assert.isTrue(scenario.getApplication(0).storageFolder.store.calledWith(
         'application.json',
-        [
-          {initialPaths: [scenario.convertRootPath('a')]},
-          {initialPaths: [scenario.convertRootPath('b'), scenario.convertRootPath('c')]}
-        ]
+        {
+          version: '1',
+          windows: [
+            {projectRoots: [scenario.convertRootPath('a')]},
+            {projectRoots: [scenario.convertRootPath('b'), scenario.convertRootPath('c')]}
+          ]
+        }
       ))
     })
 
@@ -772,9 +917,12 @@ describe('AtomApplication', function () {
 
       assert.isTrue(scenario.getApplication(0).storageFolder.store.calledWith(
         'application.json',
-        [
-          {initialPaths: [scenario.convertRootPath('a')]}
-        ]
+        {
+          version: '1',
+          windows: [
+            {projectRoots: [scenario.convertRootPath('a')]}
+          ]
+        }
       ))
     })
 
@@ -1027,7 +1175,7 @@ class LaunchScenario {
     process.env.ATOM_HOME = this.atomHome
 
     await Promise.all(
-      ['a', 'b', 'c'].map(dirPath => new Promise((resolve, reject) => {
+      ['a', 'b', 'c', 'd'].map(dirPath => new Promise((resolve, reject) => {
         const fullDirPath = path.join(this.root, dirPath)
         fs.makeTree(fullDirPath, err => {
           if (err) {
@@ -1238,9 +1386,7 @@ class LaunchScenario {
       return newWindow
     })
     this.sinon.stub(app.storageFolder, 'load', () => Promise.resolve(
-      (options.applicationJson || []).map(each => ({
-        initialPaths: this.convertPaths(each.initialPaths)
-      }))
+      options.applicationJson || {version: '1', windows: []}
     ))
     this.sinon.stub(app.storageFolder, 'store', () => Promise.resolve())
     this.applications.add(app)
