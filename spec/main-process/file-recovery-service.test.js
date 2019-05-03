@@ -26,7 +26,9 @@ describe('FileRecoveryService', () => {
     }
   })
 
-  describe('when no crash happens during a save', () => {
+  describe('when no crash happens during a save', function () {
+    this.timeout(10 * 1000)
+
     it('creates a recovery file and deletes it after saving', async () => {
       const mockWindow = {}
       const filePath = temp.path()
